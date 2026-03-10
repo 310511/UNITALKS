@@ -1,0 +1,92 @@
+UniTalks — LAST_README (Work Summary)
+
+This file documents the UI/UX fixes and gameplay features implemented in the UniTalks React app (and supporting server event forwarding) during this session.
+
+----------------------------------------------------------------------
+1) Searching overlay radar/sonar UI fixes (client)
+----------------------------------------------------------------------
+File:
+- client/src/components/common-components/SearchOverlay.js
+
+What was done:
+- Replaced the previous clipped/overflowing ripple presentation with a proper radar-style display.
+- Implemented a 160x160 circular radar container with overflow hidden.
+- Added a smooth rotating radar sweep (conic gradient) using keyframes.
+- Added concentric rings and crosshair lines.
+- Ensured the mode label and “Searching for a partner…” text are rendered below the radar, never overlapping it.
+
+Outcome:
+- Radar animation stays inside its container and animates smoothly on desktop and mobile.
+
+----------------------------------------------------------------------
+2) Songs panel volume control + layout fixes (client)
+----------------------------------------------------------------------
+File:
+- client/src/components/common-components/MusicTogether.js
+
+What was done:
+- Removed the horizontal volume slider from the top search row.
+- Implemented a right-side vertical volume slider strip (speaker icon + vertical range input).
+- Fixed mobile functional volume issues by:
+  - Using a 0.0–1.0 range input for volume.
+  - Directly applying volume to the <audio> element via audioRef.current.volume.
+  - Adding mobile touch handlers (onTouchMove/onTouchEnd) for the vertical slider.
+  - Adding touchAction: 'none' and pointerEvents: 'all' to prevent scroll stealing.
+- Ensured volume is applied whenever the audio source changes.
+
+Outcome:
+- Volume slider is visible, does not overflow the panel, and correctly changes audio volume on mobile and desktop.
+
+----------------------------------------------------------------------
+3) Shared Scoreboard (client + server forwarding)
+----------------------------------------------------------------------
+Files:
+- client/src/components/common-components/Scoreboard.js
+- client/src/components/common-components/GameTicTacToe.js
+- client/src/components/common-components/GameRPS.js
+- client/src/components/common-components/GameChess.js
+- client/src/components/common-components/GameTruthOrDare.js
+- client/src/components/VideoChat.js
+- server/server.js
+
+What was done:
+- Added a reusable `Scoreboard` component.
+- Wired all games to emit `gameScore` to the partner and call `updateScore(...)` locally at win/point events.
+- Added server forwarding for `gameScore`.
+- Implemented scoreboard rendering during gameplay (in VideoChat) and reset on partner disconnect / skip.
+
+Score-counting bug fix:
+- Fixed scoreboard “jumping to 3” by:
+  - Adding per-game `useRef` guards to ensure updateScore fires only once per round:
+    - GameTicTacToe, GameRPS, GameChess, GameTruthOrDare
+  - Adding a 1-second debounce safety net in the parent `updateScore` implementation.
+  - Routing incoming `gameScore` through the same debounced `updateScore` and cleaning up the socket handler.
+
+Outcome:
+- Each win increments by exactly +1.
+
+----------------------------------------------------------------------
+4) Truth or Dare category + flow synchronization (client + server forwarding)
+----------------------------------------------------------------------
+Files:
+- client/src/components/common-components/GameTruthOrDare.js
+- server/server.js
+
+What was done:
+- Implemented a synchronized flow using forwarded socket events:
+  - todCategory, bottleResult, todChoice, todPrompt, todVerify
+- Implemented receiver-only category selection (inviter waits).
+- Added category reset event:
+  - todCategoryReset (forwarded by server)
+- Improved mobile layout to prevent overlapping elements:
+  - scrollable panel, responsive title, wrapping badge row, responsive prompt box, wrapping buttons.
+
+Outcome:
+- Correct user sees the correct steps; category selection and prompts sync across both peers; mobile layout no longer overlaps.
+
+----------------------------------------------------------------------
+Notes
+----------------------------------------------------------------------
+- No external libraries were added.
+- Core chat/WebRTC logic was not modified as part of these changes; only game/UI and server event forwarding were updated as needed for the above features/fixes.
+
