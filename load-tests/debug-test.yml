@@ -1,0 +1,21 @@
+config:
+  target: "https://unitalks.gingr.chat"
+  engines:
+    socketio-v3: {}
+  phases:
+    - duration: 10
+      arrivalRate: 1
+  socketio-v3:
+    transports: ["polling"]
+    upgrade: false
+    reconnection: false
+    timeout: 20000
+    rejectUnauthorized: false
+    secure: true
+scenarios:
+  - engine: socketio-v3
+    flow:
+      - emit:
+          channel: "joinQueue"
+          data: { mode: "text" }
+      - think: 5

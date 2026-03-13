@@ -5,6 +5,14 @@ const crypto = require('crypto');
 
 const router = express.Router();
 
+const sharedTurnGenerator = process.env.TURN_SECRET_KEY
+  ? new TurnCredentialGenerator({
+      secret: process.env.TURN_SECRET_KEY,
+      realm: process.env.TURN_REALM || 'unitalks',
+      ttl: parseInt(process.env.TURN_CREDENTIAL_TTL || '3600', 10),
+    })
+  : null;
+
 // Rate limiting for credential requests
 const credentialLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, // 1 minute
@@ -49,16 +57,9 @@ router.get('/ice-config', credentialLimiter, async (req, res) => {
     let turnRealm = process.env.TURN_REALM || 'unitalks';
 
     // Only add TURN servers if secret key is configured
-    if (process.env.TURN_SECRET_KEY) {
-      // Initialize credential generator
-      const turnGenerator = new TurnCredentialGenerator({
-        secret: process.env.TURN_SECRET_KEY,
-        realm: turnRealm,
-        ttl: parseInt(ttl)
-      });
-
-      // Generate TURN credentials
-      credentials = turnGenerator.generateCredentials();
+    if (sharedTurnGenerator) {
+      // Generate TURN credentials (ttl can be overridden per request)
+      credentials = sharedTurnGenerator.generateCredentials(null, parseInt(ttl, 10));
 
       // TURN server with generated credentials
       iceServers.push({
@@ -189,10 +190,15 @@ router.post('/refresh-credentials', credentialLimiter, async (req, res) => {
       });
     }
 
-    const turnGenerator = new TurnCredentialGenerator();
+    if (!sharedTurnGenerator) {
+      return res.status(400).json({
+        success: false,
+        error: 'TURN server not configured'
+      });
+    }
     
     // Check if current credentials are expiring soon
-    if (!turnGenerator.isExpiringSoon(currentUsername)) {
+    if (!sharedTurnGenerator.isExpiringSoon(currentUsername)) {
       return res.json({
         success: true,
         message: 'Current credentials are still valid',
@@ -201,7 +207,7 @@ router.post('/refresh-credentials', credentialLimiter, async (req, res) => {
     }
 
     // Generate new credentials
-    const newCredentials = turnGenerator.generateCredentials();
+    const newCredentials = sharedTurnGenerator.generateCredentials();
 
     res.json({
       success: true,

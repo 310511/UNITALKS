@@ -1,0 +1,112 @@
+config:
+  target: "https://unitalks.gingr.chat"
+  engines:
+    socketio-v3: {}
+  phases:
+    # Phase 1 - Gentle warm up
+    - name: "Warm up"
+      duration: 30
+      arrivalRate: 5
+
+    # Phase 2 - Ramp up slowly
+    - name: "Ramp up"
+      duration: 60
+      arrivalRate: 5
+      rampTo: 50
+
+    # Phase 3 - Sustained medium load
+    - name: "Sustained medium"
+      duration: 60
+      arrivalRate: 50
+
+    # Phase 4 - Ramp to high load
+    - name: "High load"
+      duration: 60
+      arrivalRate: 50
+      rampTo: 150
+
+    # Phase 5 - Sustained high load
+    - name: "Sustained high"
+      duration: 60
+      arrivalRate: 150
+
+    # Phase 6 - Spike test
+    - name: "Spike"
+      duration: 30
+      arrivalRate: 300
+
+    # Phase 7 - Recovery check
+    - name: "Recovery"
+      duration: 30
+      arrivalRate: 10
+
+  socketio-v3:
+    transports: ["polling"]
+    upgrade: false
+    reconnection: false
+    timeout: 20000
+    rejectUnauthorized: false
+    secure: true
+
+  ensure:
+    p99: 5000
+    p95: 3000
+    maxErrorRate: 10
+
+scenarios:
+  # 60% text chat users
+  - name: "Text Chat User"
+    weight: 60
+    engine: socketio-v3
+    flow:
+      - emit:
+          channel: "joinQueue"
+          data: { mode: "text" }
+      - think: 2
+      - loop:
+          - emit:
+              channel: "message"
+              data: { text: "AWS load test message" }
+          - think: 4
+        count: 3
+      - emit:
+          channel: "leaveChat"
+          data: {}
+
+  # 25% voice chat users
+  - name: "Voice Chat User"
+    weight: 25
+    engine: socketio-v3
+    flow:
+      - emit:
+          channel: "joinQueue"
+          data: { mode: "voice" }
+      - think: 2
+      - emit:
+          channel: "signal"
+          data:
+            type: "offer"
+            sdp: "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n"
+      - think: 20
+      - emit:
+          channel: "leaveChat"
+          data: {}
+
+  # 15% video chat users
+  - name: "Video Chat User"
+    weight: 15
+    engine: socketio-v3
+    flow:
+      - emit:
+          channel: "joinQueue"
+          data: { mode: "video" }
+      - think: 2
+      - emit:
+          channel: "signal"
+          data:
+            type: "offer"
+            sdp: "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n"
+      - think: 30
+      - emit:
+          channel: "leaveChat"
+          data: {}

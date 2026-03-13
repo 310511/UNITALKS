@@ -1,0 +1,68 @@
+config:
+  target: "https://unitalks.gingr.chat"
+  engines:
+    socketio-v3: {}
+  phases:
+    - name: "Warm up"
+      duration: 30
+      arrivalRate: 5
+
+    - name: "Ramp up"
+      duration: 60
+      arrivalRate: 5
+      rampTo: 50
+
+    - name: "Sustained"
+      duration: 120
+      arrivalRate: 50
+
+    - name: "Spike"
+      duration: 30
+      arrivalRate: 150
+
+  socketio-v3:
+    transports: ["polling"]
+    upgrade: false
+    reconnection: false
+    timeout: 20000
+    rejectUnauthorized: false
+    secure: true
+
+  ensure:
+    p99: 3000
+    p95: 1500
+    maxErrorRate: 5
+
+scenarios:
+  - name: "Voice Chat User"
+    engine: socketio-v3
+    flow:
+      - emit:
+          channel: "joinQueue"
+          data:
+            mode: "voice"
+
+      - think: 2
+
+      # Simulate WebRTC signaling (SDP offer/answer + ICE candidates)
+      - emit:
+          channel: "signal"
+          data:
+            type: "offer"
+            sdp: "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n..."
+
+      - think: 1
+
+      - emit:
+          channel: "signal"
+          data:
+            type: "candidate"
+            candidate: "candidate:0 1 UDP 2122252543 192.168.1.1 54321 typ host"
+
+      # Simulate a voice call duration of 30 seconds
+      - think: 30
+
+      - emit:
+          channel: "leaveChat"
+          data: {}
+

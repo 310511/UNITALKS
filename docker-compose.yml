@@ -39,8 +39,7 @@ services:
     image: redis:alpine
     container_name: unitalks-redis
     restart: unless-stopped
-    ports:
-      - "6379:6379"
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD}"]
     volumes:
       - redis_data:/data
     healthcheck:
@@ -75,6 +74,11 @@ services:
       - STUN_SERVER_URL=${STUN_SERVER_URL:-stun:stun.l.google.com:19302}
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-change-me}
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     ports:
       - "5000-5010:5000"
     volumes:

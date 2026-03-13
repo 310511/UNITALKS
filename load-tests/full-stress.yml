@@ -1,0 +1,99 @@
+config:
+  target: "https://unitalks.gingr.chat"
+  engines:
+    socketio-v3: {}
+  phases:
+    - name: "Mixed ramp up"
+      duration: 60
+      arrivalRate: 20
+      rampTo: 200
+
+    - name: "Peak load"
+      duration: 180
+      arrivalRate: 200
+
+    - name: "Extreme spike"
+      duration: 60
+      arrivalRate: 500
+
+    - name: "Recovery"
+      duration: 60
+      arrivalRate: 20
+
+  socketio-v3:
+    transports: ["polling"]
+    upgrade: false
+    reconnection: false
+    timeout: 20000
+    rejectUnauthorized: false
+    secure: true
+
+  ensure:
+    p99: 5000
+    p95: 2000
+    maxErrorRate: 10
+
+scenarios:
+  # 60% text chat users
+  - name: "Text Chat User"
+    weight: 60
+    engine: socketio-v3
+    flow:
+      - emit:
+          channel: "joinQueue"
+          data:
+            mode: "text"
+      - think: 2
+      - loop:
+          - emit:
+              channel: "message"
+              data:
+                # Again, real server uses { to, message }; this is
+                # intended for stressing the handler path.
+                text: "test message {{ $randomString() }}"
+          - think: 4
+        count: 3
+      - emit:
+          channel: "leaveChat"
+          data: {}
+
+  # 25% voice users
+  - name: "Voice Chat User"
+    weight: 25
+    engine: socketio-v3
+    flow:
+      - emit:
+          channel: "joinQueue"
+          data:
+            mode: "voice"
+      - think: 2
+      - emit:
+          channel: "signal"
+          data:
+            type: "offer"
+            sdp: "v=0..."
+      - think: 20
+      - emit:
+          channel: "leaveChat"
+          data: {}
+
+  # 15% video users
+  - name: "Video Chat User"
+    weight: 15
+    engine: socketio-v3
+    flow:
+      - emit:
+          channel: "joinQueue"
+          data:
+            mode: "video"
+      - think: 2
+      - emit:
+          channel: "signal"
+          data:
+            type: "offer"
+            sdp: "v=0..."
+      - think: 30
+      - emit:
+          channel: "leaveChat"
+          data: {}
+

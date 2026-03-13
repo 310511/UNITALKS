@@ -1,0 +1,81 @@
+config:
+  target: "https://unitalks.gingr.chat"
+  engines:
+    socketio-v3: {}
+  phases:
+    # Warm up — 10 users over 30 seconds
+    - name: "Warm up"
+      duration: 30
+      arrivalRate: 10
+
+    # Ramp up — gradually increase to 100 users
+    - name: "Ramp up"
+      duration: 60
+      arrivalRate: 10
+      rampTo: 100
+
+    # Sustained load — hold 100 concurrent users
+    - name: "Sustained load"
+      duration: 120
+      arrivalRate: 100
+
+    # Spike test — sudden burst of 300 users
+    - name: "Spike"
+      duration: 30
+      arrivalRate: 300
+
+    # Cool down
+    - name: "Cool down"
+      duration: 30
+      arrivalRate: 10
+
+  socketio-v3:
+    transports: ["polling"]
+    upgrade: false
+    reconnection: false
+    timeout: 20000
+    rejectUnauthorized: false
+    secure: true
+
+  # Track these metrics
+  ensure:
+    p99: 2000       # 99th percentile response under 2 seconds
+    p95: 1000       # 95th percentile under 1 second
+    maxErrorRate: 5 # less than 5% errors
+
+scenarios:
+  - name: "Text Chat User"
+    engine: socketio-v3
+    flow:
+      # Connect to socket and join text queue
+      - emit:
+          channel: "joinQueue"
+          data:
+            mode: "text"
+
+      # Wait to be matched (simulated)
+      - think: 2
+
+      # Simulate sending messages in an active chat
+      - loop:
+          - emit:
+              channel: "message"
+              data:
+                # Note: your real server expects { to, message } – this
+                # payload is only for stressing the event handler path.
+                text: "Hello from load test user {{ $randomString() }}"
+          - think: 3
+        count: 5
+
+      # Skip to next partner
+      - emit:
+          channel: "partnerSkipped"
+          data: {}
+
+      - think: 2
+
+      # Leave chat
+      - emit:
+          channel: "leaveChat"
+          data: {}
+

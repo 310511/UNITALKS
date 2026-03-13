@@ -33,5 +33,5 @@ ENV TURN_SECRET_KEY=dummy_secret_for_testing
 WORKDIR /app/server
 EXPOSE 7860
 
-# Start Redis in the background, set FD limits, then start Node
-CMD redis-server --daemonize yes && ulimit -n 65535 && node server.js
+# Start Redis in the background, then start Node
+CMD redis-server --daemonize yes && node server.js

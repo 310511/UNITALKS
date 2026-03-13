@@ -10,6 +10,11 @@ const PREFIX = 'chat:';
 const QUEUE_PREFIX = `${PREFIX}queue:`;
 const PAIR_PREFIX = `${PREFIX}pair:`;
 const USER_COUNT_KEY = `${PREFIX}users:count`;
+const MAX_QUEUE_SIZE = Number(process.env.MAX_QUEUE_SIZE || 5000);
+
+function pairKey(mode, socketId) {
+    return `${PAIR_PREFIX}${mode}:${socketId}`;
+}
 
 const StateManager = {
     // --- Queue Management ---
@@ -19,13 +24,21 @@ const StateManager = {
             // Fallback
             if (!memoryQueues[mode]) return false;
             StateManager.removeFromAllQueues(socketId); // defined below, handles memory fallback internally
+            if (memoryQueues[mode].length >= MAX_QUEUE_SIZE) {
+                return { ok: false, error: 'queue_full' };
+            }
             memoryQueues[mode].push(socketId);
             return true;
         }
 
         try {
             await StateManager.removeFromAllQueues(socketId);
-            await redis.rPush(`${QUEUE_PREFIX}${mode}`, socketId);
+            const qKey = `${QUEUE_PREFIX}${mode}`;
+            const len = await redis.lLen(qKey);
+            if (len >= MAX_QUEUE_SIZE) {
+                return { ok: false, error: 'queue_full' };
+            }
+            await redis.rPush(qKey, socketId);
             return true;
         } catch (e) {
             console.error('Redis addToQueue error:', e);
@@ -76,8 +89,9 @@ const StateManager = {
         }
 
         // Atomic Match Script: Pops 2 users and sets their pairing in one go
-        // KEYS[1] = queue, KEYS[2] = pair map
-        // ARGV[1] = TTL
+        // KEYS[1] = queue
+        // ARGV[1] = pairKeyPrefix
+        // ARGV[2] = TTL
         const LUA_MATCH = `
             local u1 = redis.call('LPOP', KEYS[1])
             if not u1 then return nil end
@@ -86,16 +100,17 @@ const StateManager = {
                 redis.call('LPUSH', KEYS[1], u1)
                 return nil 
             end
-            redis.call('HSET', KEYS[2], u1, u2)
-            redis.call('HSET', KEYS[2], u2, u1)
-            redis.call('EXPIRE', KEYS[2], ARGV[1])
+            local k1 = ARGV[1] .. u1
+            local k2 = ARGV[1] .. u2
+            redis.call('SETEX', k1, ARGV[2], u2)
+            redis.call('SETEX', k2, ARGV[2], u1)
             return {u1, u2}
         `;
 
         try {
             const result = await redis.eval(LUA_MATCH, {
-                keys: [`${QUEUE_PREFIX}${mode}`, `${PAIR_PREFIX}${mode}`],
-                arguments: ['3600'] // 1 hour TTL
+                keys: [`${QUEUE_PREFIX}${mode}`],
+                arguments: [`${PAIR_PREFIX}${mode}:`, '3600'] // 1 hour TTL
             });
 
             if (result && result.length === 2) {
@@ -127,17 +142,18 @@ const StateManager = {
             local removed = redis.call('LREM', KEYS[1], 0, ARGV[1])
             if removed > 0 then
                 redis.call('LREM', KEYS[1], 0, ARGV[2])
-                redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
-                redis.call('HSET', KEYS[2], ARGV[2], ARGV[1])
-                redis.call('EXPIRE', KEYS[2], ARGV[3])
+                local k1 = ARGV[4] .. ARGV[1]
+                local k2 = ARGV[4] .. ARGV[2]
+                redis.call('SETEX', k1, ARGV[3], ARGV[2])
+                redis.call('SETEX', k2, ARGV[3], ARGV[1])
                 return 1
             end
             return 0
         `;
 
         const matched = await redis.eval(LUA_DIRECT, {
-            keys: [`${QUEUE_PREFIX}${mode}`, `${PAIR_PREFIX}${mode}`],
-            arguments: [partnerId, socketId, '3600']
+            keys: [`${QUEUE_PREFIX}${mode}`],
+            arguments: [partnerId, socketId, '3600', `${PAIR_PREFIX}${mode}:`]
         });
 
         return matched === 1;
@@ -151,11 +167,11 @@ const StateManager = {
             memoryPairs[mode][user2] = user1;
             return;
         }
-
-        const key = `${PAIR_PREFIX}${mode}`;
-        await redis.hSet(key, user1, user2);
-        await redis.hSet(key, user2, user1);
-        await redis.expire(key, 3600); // Prevent ghost pairs surviving server restarts
+        const ttl = 3600;
+        const multi = redis.multi();
+        multi.setEx(pairKey(mode, user1), ttl, user2);
+        multi.setEx(pairKey(mode, user2), ttl, user1);
+        await multi.exec();
     },
 
     getPartner: async (mode, socketId) => {
@@ -163,7 +179,7 @@ const StateManager = {
         if (!redis) {
             return memoryPairs[mode]?.[socketId] || null;
         }
-        return await redis.hGet(`${PAIR_PREFIX}${mode}`, socketId);
+        return await redis.get(pairKey(mode, socketId));
     },
 
     removePair: async (mode, socketId) => {
@@ -176,51 +192,91 @@ const StateManager = {
             }
             return partner;
         }
+        const k1 = pairKey(mode, socketId);
+        const partnerId = await redis.get(k1);
+        if (!partnerId) return null;
 
-        const key = `${PAIR_PREFIX}${mode}`;
-        const partnerId = await redis.hGet(key, socketId);
-
-        if (partnerId) {
-            // Remove both mappings
-            await redis.hDel(key, socketId);
-            await redis.hDel(key, partnerId);
-        }
+        const multi = redis.multi();
+        multi.del(k1);
+        multi.del(pairKey(mode, partnerId));
+        await multi.exec();
         return partnerId;
     },
 
     // Helper to remove user from all pairs across all modes
     removeAllPairs: async (socketId) => {
+        const redis = getRedisClient();
         const modes = ['text', 'voice', 'video'];
         const results = [];
 
-        for (const mode of modes) {
-            const partner = await StateManager.removePair(mode, socketId);
+        if (!redis) {
+            for (const mode of modes) {
+                const partner = await StateManager.removePair(mode, socketId);
+                if (partner) results.push({ mode, partner });
+            }
+            return results;
+        }
+
+        const keys = modes.map(m => pairKey(m, socketId));
+        const partners = await redis.mGet(keys);
+
+        const multi = redis.multi();
+        for (let i = 0; i < modes.length; i++) {
+            const partner = partners?.[i];
             if (partner) {
-                results.push({ mode, partner });
+                results.push({ mode: modes[i], partner });
+                multi.del(pairKey(modes[i], socketId));
+                multi.del(pairKey(modes[i], partner));
             }
         }
+        await multi.exec();
         return results;
     },
 
     getAnyPartner: async (socketId) => {
+        const redis = getRedisClient();
         const modes = ['text', 'voice', 'video'];
-        for (const mode of modes) {
-            const partner = await StateManager.getPartner(mode, socketId);
-            if (partner) return { mode, partner };
+        if (!redis) {
+            for (const mode of modes) {
+                const partner = await StateManager.getPartner(mode, socketId);
+                if (partner) return { mode, partner };
+            }
+            return null;
+        }
+
+        const partners = await redis.mGet(modes.map(m => pairKey(m, socketId)));
+        for (let i = 0; i < modes.length; i++) {
+            if (partners?.[i]) return { mode: modes[i], partner: partners[i] };
         }
         return null;
     },
 
     isVoiceOrVideoPartner: async (socketId, otherId) => {
-        const voiceP = await StateManager.getPartner('voice', socketId);
-        if (voiceP === otherId) return true;
-        const videoP = await StateManager.getPartner('video', socketId);
-        return videoP === otherId;
+        const redis = getRedisClient();
+        if (!redis) {
+            const voiceP = await StateManager.getPartner('voice', socketId);
+            if (voiceP === otherId) return true;
+            const videoP = await StateManager.getPartner('video', socketId);
+            return videoP === otherId;
+        }
+
+        const [voiceP, videoP] = await redis.mGet([pairKey('voice', socketId), pairKey('video', socketId)]);
+        return voiceP === otherId || videoP === otherId;
     },
 
     isAnyPartner: async (socketId, otherId) => {
-        const result = await StateManager.getAnyPartner(socketId);
-        return result && result.partner === otherId;
+        const redis = getRedisClient();
+        if (!redis) {
+            const result = await StateManager.getAnyPartner(socketId);
+            return result && result.partner === otherId;
+        }
+
+        const partners = await redis.mGet([
+            pairKey('text', socketId),
+            pairKey('voice', socketId),
+            pairKey('video', socketId)
+        ]);
+        return partners?.some(p => p === otherId) || false;
     },
 
     // --- User Count ---

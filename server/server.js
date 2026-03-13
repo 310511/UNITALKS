@@ -78,18 +78,77 @@ const io = new Server(server, {
     credentials: true,
   },
   perMessageDeflate: false, // Performance: Disable compression to save CPU/RAM at scale
-  transports: ['websocket', 'polling'], // Allow polling fallback for robustness
+  transports: ['websocket'], // CRITICAL: avoid polling (no sticky sessions)
+  allowUpgrades: false,
   allowEIO3: false,
   pingTimeout: 90000,        // Resilience: Longer timeout for event loop lag under load
   pingInterval: 25000,
   connectTimeout: 45000,
-  maxHttpBufferSize: 1e7,    // Increase to 10MB to handle large SDP bursts
+  maxHttpBufferSize: 100 * 1024, // 100KB: reduce OOM risk
   backlog: 2048             // Increase system listen backlog for connection bursts
 });
 
 // Import utilities
-const { initRedis } = require('./utils/redis');
+const { initRedis, getRedisClient, closeRedis, isRedisHealthy } = require('./utils/redis');
 const StateManager = require('./utils/stateManager');
+
+// --- Global guards / timers (per worker) ---
+let matcherInterval = null;
+let userCountBroadcastTimer = null;
+let pendingUserCount = null;
+let reconcileInterval = null;
+
+function scheduleUserCountBroadcast(count) {
+  pendingUserCount = count;
+  if (userCountBroadcastTimer) return;
+  userCountBroadcastTimer = setTimeout(() => {
+    userCountBroadcastTimer = null;
+    io.emit('userCount', pendingUserCount);
+  }, 1000);
+}
+
+function startBatchMatcher() {
+  if (matcherInterval) return;
+  matcherInterval = setInterval(async () => {
+    const modes = ['text', 'voice', 'video'];
+    for (const mode of modes) {
+      for (let i = 0; i < 20; i++) {
+        const match = await StateManager.matchUsers(mode);
+        if (!match) break;
+
+        io.to(match.initiator).emit('match', { mode, partnerId: match.receiver, initiator: true });
+        io.to(match.receiver).emit('match', { mode, partnerId: match.initiator, initiator: false });
+
+        const s1 = io.sockets.sockets.get(match.initiator);
+        if (s1) s1._p = match.receiver;
+        const s2 = io.sockets.sockets.get(match.receiver);
+        if (s2) s2._p = match.initiator;
+      }
+    }
+  }, 250);
+}
+
+async function reconcileUserCountIfLeader() {
+  const redis = getRedisClient();
+  if (!redis) return;
+
+  try {
+    const lockKey = 'chat:users:reconcile:lock';
+    const gotLock = await redis.set(lockKey, String(process.pid), { NX: true, EX: 55 });
+    if (!gotLock) return;
+
+    const workerSetKey = 'chat:users:workers:set';
+    const workers = await redis.sMembers(workerSetKey);
+    if (!workers || workers.length === 0) return;
+
+    const keys = workers.map(pid => `chat:users:worker:${pid}`);
+    const values = await redis.mGet(keys);
+    const total = (values || []).reduce((sum, v) => sum + (v ? Number(v) : 0), 0);
+    await StateManager.resetUserCount(Number.isFinite(total) ? total : 0);
+  } catch (_) {
+    // best-effort reconciliation only
+  }
+}
 
 // Initialize Redis and Socket.IO Adapter
 (async () => {
@@ -102,6 +161,30 @@ const StateManager = require('./utils/stateManager');
     console.log('Running with in-memory state (single instance mode)');
   }
 })();
+
+// Connection limit guard (protect against OOM)
+io.use((socket, next) => {
+  const max = Number(process.env.MAX_CONNECTIONS || 10000);
+  if (io.engine && io.engine.clientsCount >= max) {
+    return next(new Error('Server at capacity. Please try again later.'));
+  }
+  return next();
+});
+
+// Start single matcher interval per worker (NOT per connection)
+startBatchMatcher();
+
+// Periodic reconciliation (best-effort) to avoid drift
+reconcileInterval = setInterval(async () => {
+  const redis = getRedisClient();
+  if (redis) {
+    const workerSetKey = 'chat:users:workers:set';
+    await redis.sAdd(workerSetKey, String(process.pid));
+    await redis.expire(workerSetKey, 120);
+    await redis.set(`chat:users:worker:${process.pid}`, String(io.engine?.clientsCount || 0), { EX: 120 });
+    await reconcileUserCountIfLeader();
+  }
+}, 60_000);
 
 // Rate limit for support submissions
 const supportLimiter = rateLimit({
@@ -149,8 +232,7 @@ app.post('/api/support', supportLimiter, async (req, res) => {
       return res.status(500).json({ ok: false, error: 'Support address not configured' });
     }
 
-    // Configure transport (use SMTP creds from env or fallback to JSON transport)
-    const transport = nodemailer.createTransport({
+    const mailTransport = nodemailer.createTransport({
       host: process.env.SMTP_HOST,
       port: process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : 587,
       secure: process.env.SMTP_SECURE === 'true',
@@ -159,6 +241,8 @@ app.post('/api/support', supportLimiter, async (req, res) => {
         pass: process.env.SMTP_PASS,
       } : undefined,
       jsonTransport: (!process.env.SMTP_HOST || !process.env.SMTP_USER) ? true : undefined,
+      pool: true,
+      maxConnections: 5,
     });
 
     const mail = {
@@ -168,7 +252,7 @@ app.post('/api/support', supportLimiter, async (req, res) => {
       text: `Type: ${type}\nSubject: ${subject || '-'}\nContact: ${contact || '-'}\n\nMessage:\n${message}`,
     };
 
-    await transport.sendMail(mail);
+    await mailTransport.sendMail(mail);
     return res.json({ ok: true });
   } catch (err) {
     return res.status(500).json({ ok: false, error: 'Failed to submit' });
@@ -255,7 +339,7 @@ const ErrorHandler = {
 };
 
 // Helper function for simple event forwarding
-function createForwardHandler(eventName) {
+function createForwardHandler(socket, eventName) {
   return ({ to, ...data }) => {
     if (!to) return;
     io.to(to).emit(eventName, { from: socket.id, ...data });
@@ -284,7 +368,7 @@ function setupRequestHandlers(socket, configs) {
 
 io.on('connection', async (socket) => {
   const onlineUsers = await StateManager.incrementUserCount();
-  io.emit('userCount', onlineUsers);
+  scheduleUserCountBroadcast(onlineUsers);
 
   // Handle joining different chat modes
   socket.on('joinQueue', async (data) => {
@@ -315,35 +399,16 @@ io.on('connection', async (socket) => {
       }
     }
 
-    // Add to queue
+    // Add to queue (with queue-size cap)
     const added = await StateManager.addToQueue(mode, socket.id);
-    if (!added) return;
+    if (!added || added === false) return;
+    if (added && added.ok === false && added.error === 'queue_full') {
+      ErrorHandler.sendError(socket, 'joinQueueError', new Error('Queue is full, please retry shortly'), { mode });
+      return;
+    }
 
     // Random matching is now handled by the background batch matcher
   });
-
-  // Background Batch Matcher: Reduces thundering herd contention on Redis
-  // Each worker attempts to match users every 250ms
-  setInterval(async () => {
-    const modes = ['text', 'voice', 'video'];
-    for (const mode of modes) {
-      // Process up to 20 matches per tick per mode per worker (80 pairs/sec/core)
-      for (let i = 0; i < 20; i++) {
-        const match = await StateManager.matchUsers(mode);
-        if (!match) break;
-
-        io.to(match.initiator).emit('match', { mode, partnerId: match.receiver, initiator: true });
-        io.to(match.receiver).emit('match', { mode, partnerId: match.initiator, initiator: false });
-
-        // Cache partner info locally on existing sockets to avoid Redis lookup overhead during signaling
-        const s1 = io.sockets.sockets.get(match.initiator);
-        if (s1) s1._p = match.receiver;
-        const s2 = io.sockets.sockets.get(match.receiver);
-        if (s2) s2._p = match.initiator;
-      }
-    }
-  }, 250);
-
 
   // Simple forwarding events with validation
   const forwardEvents = [
@@ -379,11 +444,20 @@ io.on('connection', async (socket) => {
   });
 
   // Handle text messages with validation
-  socket.on('message', ({ to, message }) => {
+  socket.on('message', async ({ to, message }) => {
+    if (!allowSocketEvent(socket, 1)) return;
+
     if (!Validation.isValidSocketId(to)) {
       ErrorHandler.sendError(socket, 'messageError', new Error('Invalid recipient'), { to });
       return;
     }
+
+    let isPartner = socket._p === to;
+    if (!isPartner) {
+      isPartner = await StateManager.isAnyPartner(socket.id, to);
+      if (isPartner) socket._p = to;
+    }
+    if (!isPartner) return;
 
     if (!Validation.validateMessage(message)) {
       ErrorHandler.sendError(socket, 'messageError', new Error('Invalid message'), { message });
@@ -425,7 +499,7 @@ io.on('connection', async (socket) => {
   // Handle disconnection
   socket.on('disconnect', async () => {
     const count = await StateManager.decrementUserCount();
-    io.emit('userCount', count);
+    scheduleUserCountBroadcast(count);
 
     await StateManager.removeFromAllQueues(socket.id);
 
@@ -548,11 +622,18 @@ if (cluster.isPrimary && process.env.NODE_ENV === 'production' && process.env.DI
 // Graceful shutdown
 const shutdown = (signal) => {
   try {
-    server.close(() => {
-      process.exit(0);
+    if (matcherInterval) clearInterval(matcherInterval);
+    if (reconcileInterval) clearInterval(reconcileInterval);
+    if (userCountBroadcastTimer) clearTimeout(userCountBroadcastTimer);
+
+    io.close(() => {
+      server.close(async () => {
+        try { await closeRedis(); } catch (_) {}
+        process.exit(0);
+      });
     });
     // Force exit if not closed in time
-    setTimeout(() => process.exit(0), 5000).unref();
+    setTimeout(() => process.exit(0), 10_000).unref();
   } catch (_) {
     process.exit(1);
   }
